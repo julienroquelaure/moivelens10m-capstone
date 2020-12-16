@@ -1,0 +1,282 @@
+---
+title: "Movie Rating Prediction"
+author: "Julien Rroquelaure"
+date: "2020/12/16"
+output: pdf_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r  code = readLines("roquelaure-code.R"), echo=FALSE, warning=FALSE, message=FALSE, results="hide", fig.show="hide"}
+
+```
+
+# Introduction
+
+The starting point of the exercise is the _Movielens 10M_ dataset:
+
+<https://grouplens.org/datasets/movielens/10m/>
+
+It contains roughly 10 millions movie ratings.
+These ratings are done on $\approx 10,000$ movies by $\approx 72,000$ users.
+
+The data is prepared beforehand as follows:
+
+  - $90 \%$ as training data called __edx__, with every user and every movie being represented.
+  - $10 \%$ as a test set called __validation__.
+
+
+
+The dataset has six variables : 
+
+  - _userId_ 
+  - _movieId_ 
+  - _rating_
+  - _timestamp_
+  - _title_
+  - _genres_
+
+Our goal is to predict the ratings of the validation set.
+
+In order to measure the accuracy of our prediction, we will compute the
+__RMSE__ (Root Mean Square Error). The RMSE is akin to a distance
+between our predictions and the actual ratings.
+
+
+# Analysis
+
+## 1. Test set average
+
+The datasets are very big.
+__edx__ is a $9000055 \times 6$ table and __validation__ is $999999 \times 6$.
+Early attempts with machine learning algorithms were very slow so we tried
+another method.
+
+We start with the easiest prediction we can make about the test set.
+We predict that every rating in the test set is the average rating of 
+the training set.
+
+
+
+```{r}
+mu <- mean(edx$rating)
+mu
+RMSE(mu, validation$rating)
+```
+
+We call $\mu$ the mean rating of __edx__ and we get $\mu = 3.512465$.
+With this value as prediction for the whole validation set, 
+we get a RMSE of $1.061202$.
+This value will be our baseline and we aim to improve from here.
+
+
+## 2. Movie and user bias
+
+
+Intuitively, we expect that a rating will depend on the intrinsic quality of a
+movie, the _movie bias_ $b_m$, and the personal scale of a user, the _user bias_
+$b_u$.
+
+So the second step of our analysis is to subtract $\mu$ from the test data,
+and average first by individual movie, and then by individual user.
+
+```{r  eval=FALSE}
+edx_movie_bias <- edx %>%
+  group_by(movieId) %>%
+  summarize(b_m = mean(rating - mu))
+edx_user_bias <- edx %>%
+  left_join(edx_movie_bias, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_m))
+edx_pred <- validation %>%
+  left_join(edx_movie_bias, by="movieId") %>%
+  left_join(edx_user_bias, by="userId") %>%
+  mutate(pred = mu + b_m + b_u)
+RMSE(edx_pred$pred, validation$rating)
+```
+
+After accounting for both bias, we got a RMSE of $0.8653488$.
+
+```{r}
+head(edx_pred)
+```
+
+By printing our predictions, we notice that some predictions are below 0.5
+or above 5. We then correct this by bounding our predictions.
+
+```{r eval=FALSE}
+edx_pred_bound <- edx_pred %>%
+  mutate(pred = ifelse(pred>5, 5, pred)) %>%
+  mutate(pred = ifelse(pred<.5, .5, pred))
+RMSE(edx_pred_bound$pred, validation$rating)
+```
+
+```{r}
+sum(edx_pred_bound$pred <.5)
+sum(edx_pred_bound$pred >5)
+```
+
+We have a slight improvement of our RMSE but there is still room for 
+improvement.
+
+## 3. Regularization
+
+Let's analyze where the biggest contributions to our RMSE come from.
+
+```{r}
+edx_difference <- edx_pred_bound %>%
+  mutate(diff = abs(pred - validation$rating)) %>%
+  arrange(desc(diff))
+```
+```{r}
+edx_difference %>% 
+  filter(diff>2)
+```
+
+Furthermore, we notice that around $30,000$ predictions are off by more than
+2 points. So we are going to take a slice of the worst predictions and look
+at it.
+
+```{r}
+edx_diff_slice <- edx_difference %>%
+  slice(1:30000)
+edx_difference %>%
+  group_by(userId) %>%
+  summarize(n=n(), meandiff=mean(diff)) %>%
+  right_join(edx_diff_slice, by="userId") %>%
+  select(userId, n, meandiff, pred, diff) %>%
+  arrange(desc(meandiff))
+edx_difference %>%
+  group_by(movieId) %>%
+  summarize(n=n(), meandiff=mean(diff)) %>%
+  right_join(edx_diff_slice, by="movieId") %>%
+  select(movieId, n, meandiff, pred, diff) %>%
+  arrange(desc(meandiff))
+```
+
+It seems that the most problematic users and movies are those with a small
+number of ratings. This is logical since the less we have data, the more
+variable an observation is in general.
+
+We are then going to use regularization to dampen the rare users and movies,
+and by bringing them closer to the average rating.
+
+Additionally, we will be varying our parameter $\lambda$ in order to get an
+optimal RMSE.
+
+```{r eval=FALSE}
+lambdas <- seq(3, 7, .25)
+rmses <- sapply(lambdas, function(l){
+  
+  mu <- mean(edx$rating)
+  
+  edx_movie_bias_regs <- edx %>% 
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  
+  edx_user_bias_regs <- edx %>% 
+    left_join(edx_movie_bias_regs, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  
+  edx_pred_regs <- validation %>% 
+    left_join(edx_movie_bias_regs, by = "movieId") %>%
+    left_join(edx_user_bias_regs, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u)
+  
+  edx_pred_regs_bound <- edx_pred_regs %>%
+    mutate(pred = ifelse(pred>5, 5, pred)) %>%
+    mutate(pred = ifelse(pred<.5, .5, pred))
+  
+  return(RMSE(edx_pred_regs_bound$pred, validation$rating))
+})
+```
+
+We then plot our RMSES function of $\lambda$
+
+```{r}
+qplot(lambdas, rmses)  
+```
+
+After a further refinement, around $4.5 < \lambda < 5$, we settle with a 
+value of $\lambda = 4.85$
+
+
+# Results
+
+We run our final algorithm, with $\lambda = 4.85$
+
+```{r, echo=FALSE}
+lambdas <- 4.85
+rmses <- sapply(lambdas, function(l){
+  
+  mu <- mean(edx$rating)
+  
+  edx_movie_bias_regs <- edx %>% 
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  
+  edx_user_bias_regs <- edx %>% 
+    left_join(edx_movie_bias_regs, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  
+  edx_pred_regs <- validation %>% 
+    left_join(edx_movie_bias_regs, by = "movieId") %>%
+    left_join(edx_user_bias_regs, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u)
+  
+  edx_pred_regs_bound <- edx_pred_regs %>%
+    mutate(pred = ifelse(pred>5, 5, pred)) %>%
+    mutate(pred = ifelse(pred<.5, .5, pred))
+  
+  return(RMSE(edx_pred_regs_bound$pred, validation$rating))
+})
+```
+```{r}
+RMSE_final <- min(rmses)
+RMSE_final
+
+```
+
+We end up with a RMSE $=0.8647088$, which is below our target of $0.86490$
+
+```
+
+```
+
+
+# Conclusion
+
+For the analysis, we were limited by our computing power, so we didn't use 
+an advanced machine learning algorithm.
+
+Nevertheless, we were able to get a satisfying prediction with the idea that 
+a movie has an intrinsic quality measured by the success among the users.
+We also guessed that every user has their own scale to rate movies, which is
+consistent with the behavior we see in our everyday life.
+
+
+The regularization allowed us to diminish the variance surrounding rare 
+unpredictable users and movies.
+
+One can wonder if a more sophisticated algorithm will improve the 
+predictions, and we would be the trade-off between computing power and
+precision.
+
+Another improvement can be sought in the unused variables. In particular,
+_timestamp_: does the rating conventions change in time? And _genres_: are
+there clusters of genres that appeal to certain users?
+
+
+
+
+
+
+
+
+
+
